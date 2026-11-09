@@ -9,7 +9,7 @@ jobs:
   build:
     # macos-13 是 Intel 标准档，公开仓库免费可用。
     # macos-14/15 会解析成 arm64-us-xl 私有规格，公开仓库拿不到会 2 秒 Cancelled。
-    runs-on: macos-13
+    runs-on: macos-15
     timeout-minutes: 15
 
     steps:
