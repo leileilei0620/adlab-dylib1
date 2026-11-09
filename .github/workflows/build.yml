@@ -1,27 +1,16 @@
-name: build-adlab-dylib
-
-# 在 GitHub 的 macOS runner 上用 Xcode 的 iphoneos SDK 交叉编译出 arm64 dylib。
-# 产出物：libadlab.dylib（未签名，直接丢给 TrollFools 注入）
-#
-# 用法：
-#   1) 新建一个 GitHub 仓库（可以 private）
-#   2) 把本目录（adlab-ios）的全部内容推到仓库根
-#   3) Actions 会自动跑，跑完在 run 页面底部 Artifacts 里下载 adlab-dylib
-#   4) 解压得到 libadlab.dylib，AirDrop / 微信 / 爱思 传到手机
-#   5) 手机上用 TrollFools 选「爷爷的农院日记」→ 注入这个 dylib
+name: build
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    # 必须是 Intel macOS 标准 runner：macos-14 / macos-15 会被解析成
-    # arm64-us-xl 规格（私有仓库拿不到该规格，报 "configuration ... is not supported"）。
-    # Intel 机器交叉编译 arm64 完全没问题 —— build.sh 里显式带 -arch arm64 -isysroot，
-    # Xcode 的 iphoneos SDK 本身就同时含 arm64 与 arm64e slice。
-    runs-on: macos-15
+    # macos-13 是 Intel 标准档，公开仓库免费可用。
+    # macos-14/15 会解析成 arm64-us-xl 私有规格，公开仓库拿不到会 2 秒 Cancelled。
+    runs-on: macos-13
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -29,7 +18,7 @@ jobs:
 
       - name: Show toolchain
         run: |
-          xcodebuild -version
+          xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
           xcrun --sdk iphoneos --show-sdk-version
 
@@ -40,70 +29,102 @@ jobs:
 
       - name: Verify artifact
         run: |
-          F=build/libadlab.dylib
-          test -f "$F" || { echo "FAIL: 产物不存在"; exit 1; }
+          set -e
+          F="build/libadlab.dylib"
+          test -f "$F" || { echo "失败: 未找到工件"; exit 1; }
 
-          echo "===== 基本信息 ====="
-          file "$F"
-          lipo -info "$F"
+          echo "=== 基本信息 ==="
           ls -l "$F"
+          file "$F"
           shasum -a 256 "$F"
 
-          echo "===== 架构必须 arm64 ====="
-          if ! lipo -info "$F" | grep -q arm64; then
-            echo "FAIL: 架构不是 arm64"
+          echo
+          echo "=== 架构必须是 thin arm64 ==="
+          ARCHS="$(lipo -archs "$F")"
+          echo "archs: $ARCHS"
+          test "$ARCHS" = "arm64" || { echo "失败: 架构应为 arm64，实际 $ARCHS"; exit 1; }
+
+          echo
+          echo "=== 绝对禁止 __interpose ==="
+          echo "v1 用 __interpose 拦 _dyld_get_image_name，dyld 绑定期就拿到 NULL，"
+          echo "导致注入后必然闪退。v2 起彻底删除，这里出现即为编到旧源码。"
+          if otool -l "$F" | grep -q '__interpose'; then
+            echo "失败: 发现 __interpose 段"
+            otool -l "$F" | grep -n -A3 '__interpose'
             exit 1
           fi
-          echo "OK: arm64"
+          echo "OK: 无 __interpose"
 
-          echo "===== 加载命令（含 __interpose 检查）====="
-          otool -l "$F" > /tmp/lc.txt || true
-          if grep -q '__interpose' /tmp/lc.txt; then
-            echo "FAIL: 仍含 __interpose 段 —— 这是 v1 的闪退根因（_dyld_get_image_name 被 interpose 后在绑定期返回 NULL）"
-            grep -n -A3 '__interpose' /tmp/lc.txt
-            exit 1
+          echo
+          echo "=== 禁止全局 C 函数 hook（dlopen/dlsym 会走 interpose 重定向自递归）==="
+          if nm -u "$F" 2>/dev/null | grep -qE ' _dlsym$'; then
+            echo "警告: 引入了 dlsym（当前源码不使用，出现说明编到旧版本）"
+          else
+            echo "OK: 无 dlsym"
           fi
-          echo "OK: 无 __interpose（符合 v2 设计）"
 
-          echo "===== 锚点字符串（硬性）====="
-          if ! strings -a "$F" | grep -q 'showInspireAd:'; then
-            echo "FAIL: 锚点 showInspireAd: 缺失，补丁不可能命中"
+          echo
+          echo "=== LC_ID_DYLIB 必须指向 Frameworks/ ==="
+          IDLINE="$(otool -l "$F" | grep -A2 LC_ID_DYLIB | grep 'name ' | head -1 || true)"
+          echo "$IDLINE"
+          echo "$IDLINE" | grep -q '@executable_path/Frameworks/' || {
+            echo "失败: LC_ID_DYLIB 不是 @executable_path/Frameworks/ 形式"
+            echo "      （TrollFools 会把它当 @rpath 处理，install_name_tool -change 变空操作）"
             exit 1
-          fi
-          echo "OK: 锚点 showInspireAd: 在位"
+          }
+          echo "OK: LC_ID_DYLIB 正确"
 
-          echo "===== v2 关键符号（仅告警，static 函数可能被内联）====="
-          nm -a "$F" 2>/dev/null > /tmp/syms.txt || true
-          strings -a "$F" > /tmp/strs.txt || true
-          for sym in adlab_patch_on_disk adlab_install_read_hooks \
-                     adlab_install_stealth adlab_swizzle adlab_clean_class \
-                     adlab_neutralize_method objc_getClassList; do
-            if grep -q "$sym" /tmp/syms.txt || grep -q "$sym" /tmp/strs.txt; then
-              echo "OK: $sym"
+          echo
+          echo "=== 必备 selector 必须在 strings 里（硬性）==="
+          for sel in \
+              "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:" \
+              "displayLinkWithTarget:selector:" \
+              "setRate:" \
+              "sendEvent:" \
+              "timeIntervalSinceReferenceDate"
+          do
+            if strings -a "$F" | grep -q -- "$sel"; then
+              echo "  OK   $sel"
             else
-              echo "::warning::符号 $sym 未出现（static 内联，不阻断构建）"
+              echo "  FAIL $sel 缺失"
+              exit 1
             fi
           done
 
-          echo "===== v1 残留符号（应为 0）====="
+          echo
+          echo "=== 关键实现符号（static 可能被 -O2 内联，只告警不阻断）==="
+          for sym in \
+              kswizzle hook_DoubleZeroArg name_is_numerator name_is_denominator \
+              install_time_hooks install_timer_hooks install_player_hooks \
+              install_discovered_hooks install_shake_block install_stealth \
+              cfg_domain cfg_load cfg_save AdlabWindow AdlabBall AdlabPanel
+          do
+            if nm -a "$F" 2>/dev/null | grep -q "_$sym"; then
+              echo "  OK   $sym"
+            else
+              echo "::warning::未找到符号 $sym（可能已内联）"
+            fi
+          done
+
+          echo
+          echo "=== 禁止残留的 v1 符号 ==="
           for bad in adlab_fopen _interpose_fopen resolve_fopen_original gOrigDyldImageName; do
-            if grep -q "$bad" /tmp/syms.txt || grep -q "$bad" /tmp/strs.txt; then
-              echo "FAIL: 发现 v1 残留符号 $bad"
+            if nm -a "$F" 2>/dev/null | grep -q "_$bad"; then
+              echo "失败: 残留 v1 符号 $bad"
               exit 1
             fi
           done
           echo "OK: 无 v1 残留符号"
 
-          echo "===== 平台信息 ====="
+          echo
+          echo "=== 部署目标 ==="
           vtool -show-build "$F" || true
-          echo "===== Verify 全部通过 ====="
 
-      # 即使 Verify 判红也要把产物交出来 —— 编译成功的东西不能因为一个检查丢掉
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: adlab-dylib
+          name: libadlab
           path: build/libadlab.dylib
           if-no-files-found: warn
           retention-days: 30
