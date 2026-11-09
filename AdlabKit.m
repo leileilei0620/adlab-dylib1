@@ -59,6 +59,7 @@ static BOOL   gBlockShake = YES;
 static int g_hitTime = 0, g_hitTimer = 0, g_hitPlayer = 0, g_hitDiscovered = 0;
 static int g_hitShake = 0, g_hitStealth = 0;
 static int g_classesScanned = 0, g_classesMatched = 0;
+static int gSceneRetry = 0;      // UI 安装时「场景未就绪」的重试计数
 
 static NSMutableArray<NSString *> *gLogLines = nil;
 static NSLock *gLogLock = nil;
@@ -428,6 +429,19 @@ static BOOL sel_looks_progress(const char *nm)
 //   若两个都乘 倍速，比值不变，进度条一动不动。
 //   正确做法：分子（当前进度）乘倍速，分母（总时长）除倍速，
 //   于是 progress 被放大 倍速² 倍，播到终点的时间变成 1/倍速。
+// ⚠ 方向修正（v3.1）
+// 上面那段注释里的推导是错的，实测后改正：
+//   progress = current / total
+//   若 current *= k 且 total /= k，则 progress *= k²
+//   k² 会让进度涨得快 —— 但「播完」的判定通常是 current >= total，
+//   这个条件**不成立**（current 涨 k 倍，total 也变小 k 倍，但两者同步到达的值不是 1）。
+// 所以正确做法是「只压时间，不压比例」：
+//   分子（当前时间）* k  → total/current 比值不变，但 current 到达 total 的**墙钟时间**变成 1/k
+//   分母（总时长）保持不动
+// 这样：进度条按真实速度走完（视觉上快了 k 倍），且 current>=total 的判定仍成立。
+// 之前的实现把分母也除了 k，导致 progress 涨 k² 倍，有些 SDK 的
+// currentPlayTime 直接冲过 totalTime，反而让播放器 seek 越界 —— 这就是
+// 「放大 0 个 getter」之外我担心的第二个问题，一并修掉。
 static BOOL name_is_numerator(const char *sn)
 {
     const char *num[] = {
@@ -467,6 +481,7 @@ static BOOL hook_DoubleZeroArg(Class cls, Method m)
 
     IMP repl;
     if (isNum && !isDen) {
+        // 分子：当前播放时间 * 倍速。分母不动 → 比真实播完所需的墙钟时间 ÷ 倍速
         repl = imp_implementationWithBlock(^double(id self) {
             double v = ((double (*)(id, SEL))orig)(self, sel);
             if (gSpeed <= 1.0001 || v <= 0.0) return v;
@@ -474,12 +489,14 @@ static BOOL hook_DoubleZeroArg(Class cls, Method m)
             return v * gSpeed;
         });
     } else if (isDen && !isNum) {
+        // 分母：**保持原值**。不把总时长缩小，否则 current/total 会被放平方倍、
+        // 触发播放器 seek 越界或「已播完」误判。
+        // 这里仍然挂一遍：一是计数用，二是把值钳到合法范围防 NaN/负数。
         repl = imp_implementationWithBlock(^double(id self) {
             double v = ((double (*)(id, SEL))orig)(self, sel);
-            if (gSpeed <= 1.0001 || v <= 1.0) return v;
+            if (v != v || v <= 0.0) return v;           // NaN / 非正 → 原样
             g_hitDiscovered++;
-            double r = v / gSpeed;
-            return (r < 1.0) ? 1.0 : r;
+            return v;
         });
     } else {
         return NO;                                     // 同时像分子和分母，太模糊，放弃
@@ -699,7 +716,7 @@ static void install_stealth(void)
 @end
 
 @interface AdlabOverlay : NSObject
-@property (nonatomic, strong) AdlabWindow *win;
+@property (nonatomic, strong) UIWindow *win;   // 仅记录宿主 window，不持有独立窗口
 @property (nonatomic, strong) AdlabBall *ball;
 @property (nonatomic, strong) AdlabPanel *panel;
 + (instancetype)shared;
@@ -845,59 +862,84 @@ static void install_stealth(void)
 
 - (void)install
 {
-    if (self.win) return;
+    if (self.ball) return;
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self install]; });
         return;
     }
 
     @try {
-        // iOS 13+ 不绑 UIScene 的 UIWindow 永远不显示
-        UIWindowScene *scene = nil;
+        CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+        CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+        if (sw < 1 || sh < 1) { sw = 375; sh = 667; }
+        CGFloat bx = sw - 56;
+        CGFloat by = sh * 0.35;
+
+        // ── 方案 A：挂到游戏现有的 keyWindow（首选，绕开 UIScene 全部坑）
+        // 自己造 UIWindow 在 iOS 13+ 必须绑 windowScene，而 constructor 时机
+        // 拿不到 ForegroundActive 的 scene（实测日志 scene=0，界面永不出现）。
+        // 直接往现有 window 上加子视图，宿主 app 自己已经把 scene 处理好了。
+        UIWindow *host = nil;
         if (@available(iOS 13.0, *)) {
             for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
                 if (![s isKindOfClass:[UIWindowScene class]]) continue;
-                if (s.activationState == UISceneActivationStateForegroundActive) {
-                    scene = (UIWindowScene *)s;
-                    break;
+                if (s.activationState != UISceneActivationStateForegroundActive) continue;
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w.isKeyWindow) { host = w; break; }
                 }
-                if (!scene) scene = (UIWindowScene *)s;
+                if (!host) {
+                    for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                        if (!w.hidden && w.windowLevel <= UIWindowLevelNormal + 1) { host = w; break; }
+                    }
+                }
+                if (host) break;
+            }
+        }
+        if (!host) host = [UIApplication sharedApplication].keyWindow;   // 兜底（iOS<13 或上面没找到）
+        if (!host) {
+            // 再兜底：遍历所有 window（app 可能还没 makeKey）
+            if (@available(iOS 13.0, *)) {
+                for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                    if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                    for (UIWindow *w in ((UIWindowScene *)s).windows) { host = w; break; }
+                    if (host) break;
+                }
             }
         }
 
-        CGFloat sw = [UIScreen mainScreen].bounds.size.width;
-        CGFloat sh = [UIScreen mainScreen].bounds.size.height;
-
-        self.win = [[AdlabWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        if (@available(iOS 13.0, *)) {
-            if (scene) self.win.windowScene = scene;
+        if (!host) {
+            gSceneRetry++;
+            if (gSceneRetry <= 120) {                      // 最多等 60 秒
+                if (gSceneRetry <= 3 || gSceneRetry % 20 == 0)
+                    KLOG("还没拿到宿主 window，1s 后重试（第 %d 次）", gSceneRetry);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [self install]; });
+                return;
+            }
+            KLOG("60 秒内始终没有可用 window，UI 放弃（hook 仍在工作）");
+            return;
         }
-        self.win.windowLevel = UIWindowLevelAlert + 100;
-        self.win.backgroundColor = [UIColor clearColor];
 
-        UIViewController *vc = [[UIViewController alloc] init];
-        vc.view.backgroundColor = [UIColor clearColor];
-        self.win.rootViewController = vc;
-        [self.win makeKeyAndVisible];
-
-        // 悬浮球
-        self.ball = [[AdlabBall alloc] initWithFrame:CGRectMake(sw - 56, sh * 0.35, 44, 44)];
+        // 悬浮球（直接加在宿主 window 上，不加中间容器，避免挡住游戏）
+        self.ball = [[AdlabBall alloc] initWithFrame:CGRectMake(bx, by, 44, 44)];
         [self.ball addTarget:self action:@selector(onBallTap)
             forControlEvents:UIControlEventTouchUpInside];
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
                                        initWithTarget:self action:@selector(onBallPan:)];
         [self.ball addGestureRecognizer:pan];
-        [vc.view addSubview:self.ball];
+        [host addSubview:self.ball];
+        self.win = host;                                   // 记下宿主，供 refresh 用
 
         // 面板
         CGFloat pw = 300, ph = 420;
         self.panel = [[AdlabPanel alloc] initWithFrame:
                       CGRectMake((sw - pw) / 2.0, (sh - ph) / 2.0, pw, ph)];
         self.panel.hidden = YES;
-        [vc.view addSubview:self.panel];
+        [host addSubview:self.panel];
 
         [self refresh];
-        KLOG("UI 已安装 %.0fx%.0f scene=%d", sw, sh, scene != NULL);
+        KLOG("UI 已安装(挂宿主) %.0fx%.0f host=%@ retry=%d ball=(%.0f,%.0f)",
+             sw, sh, NSStringFromClass([host class]), gSceneRetry, bx, by);
     } @catch (NSException *e) {
         KLOG("UI 安装异常 %s", e.reason.UTF8String);
     }
@@ -932,10 +974,11 @@ static void install_stealth(void)
     self.panel.statLab.text = [NSString stringWithFormat:
         @"域  %@\n"
         @"时间源 %d  定时器 %d  播放器 %d\n"
-        @"摇一摇 %d  反检测 %d  发现类 %d/%d",
+        @"摇一摇 %d  反检测 %d  类 %d/%d  放大 %d",
         cfg_domain(),
         g_hitTime, g_hitTimer, g_hitPlayer,
-        g_hitShake, g_hitStealth, g_classesMatched, g_classesScanned];
+        g_hitShake, g_hitStealth, g_classesMatched, g_classesScanned,
+        g_hitDiscovered];
 
     if (self.panel.logView && gLogLock) {
         [gLogLock lock];
