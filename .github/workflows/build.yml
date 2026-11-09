@@ -21,7 +21,7 @@ jobs:
     # arm64-us-xl 规格（私有仓库拿不到该规格，报 "configuration ... is not supported"）。
     # Intel 机器交叉编译 arm64 完全没问题 —— build.sh 里显式带 -arch arm64 -isysroot，
     # Xcode 的 iphoneos SDK 本身就同时含 arm64 与 arm64e slice。
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
