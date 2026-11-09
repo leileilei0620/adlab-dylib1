@@ -1,77 +1,77 @@
 #!/usr/bin/env bash
-# ============================================================================
-#  编译 AdlabOverlay dylib （需要在 macOS 上跑）
-#
-#  两种平台都能出这个 dylib：
-#    1) 越狱机 / Mac 上装了 theos   -> 用 theos 的 iphoneos toolchain
-#    2) 只有 Xcode                -> 用 xcrun -sdk iphoneos clang（下面的默认路径）
-#
-#  TrollFools 吃的是「未签名 dylib」，所以不需要 ldid / codesign，
-#  但 dylib 的 platform 必须是 iphoneos（不能是 iphonesimulator / macosx）。
-# ============================================================================
+# AdlabKit 构建脚本 —— 通用 iOS 广告加速 dylib
+# 用法: ./build.sh        （在 macOS 上，需 Xcode Command Line Tools）
+#       SDK=/path ./build.sh
 set -euo pipefail
 
 SDK="${SDK:-$(xcrun --sdk iphoneos --show-sdk-path)}"
-MIN="${MIN:-12.0}"                 # 目标机 iOS 15.3.1，12.0 起兼容最广
-ARCH="${ARCH:-arm64}"              # iPhone 11 (A13) = arm64
-OUT="${OUT:-build/libadlab.dylib}"
+SRC="AdlabKit.m"
+OUT="build"
+DYLIB="$OUT/libadlab.dylib"
 
-SRC="AdlabOverlay.m"
-# 必须显式链 CoreGraphics：CGPointZero / CGRectZero 这类是 extern const 变量，
-# 不是内联函数，不链就会报 Undefined symbols "_CGPointZero"。
-# UIKit 会传递链接 CoreGraphics 对 app 有效，但对 -dynamiclib 的未定义符号
-# 解析不保证能借道，所以显式列出来。
-FRAMEWORKS="-framework UIKit -framework Foundation -framework CoreGraphics"
-# 不再单独写 -lobjc：Foundation 已经链入 libobjc，重复写会让 ld 报
-# "ignoring duplicate libraries: '-lobjc'"（无害但干扰日志判读）。
+mkdir -p "$OUT"
 
-mkdir -p "$(dirname "$OUT")"
+echo "== 环境 =="
+echo "SDK   $SDK"
+echo "SRC   $SRC ($(wc -c < "$SRC" | tr -d ' ') B)"
+echo "ARCH  arm64"
+echo
 
-echo "==> SDK       : $SDK"
-echo "==> min iOS   : $MIN"
-echo "==> arch      : $ARCH"
-echo "==> output    : $OUT"
+# 依赖：UIKit/Foundation 基础，QuartzCore（CADisplayLink 的 layer）、
+#      AVFoundation（AVPlayer setRate:）、CoreMedia（时间换算）、
+#      CoreGraphics（CGPointZero 已被 CGPointMake 取代，但仍需链接）
+FRAMEWORKS="-framework UIKit -framework Foundation -framework QuartzCore \
+-framework AVFoundation -framework CoreMedia -framework CoreGraphics"
 
+echo "== 编译 =="
 xcrun --sdk iphoneos clang \
-    -arch "$ARCH" \
-    -miphoneos-version-min="$MIN" \
+    -arch arm64 \
+    -miphoneos-version-min=12.0 \
     -isysroot "$SDK" \
     -dynamiclib \
-    -fobjc-arc \
     -O2 \
-    -fvisibility=hidden \
-    -Wl,-install_name,@executable_path/Frameworks/libadlab.dylib \
-    -Wl,-dead_strip \
+    -fobjc-arc \
+    -fmodules \
+    -Wall -Wextra \
+    -Wno-unused-parameter \
     -Wno-deprecated-declarations \
+    -install_name "@executable_path/Frameworks/libadlab.dylib" \
     $FRAMEWORKS \
-    -o "$OUT" \
+    -o "$DYLIB" \
     "$SRC"
 
 echo
-echo "==> 产出"
-ls -l "$OUT"
-file "$OUT" || true
-
+echo "== 产物 =="
+ls -l "$DYLIB"
+file "$DYLIB"
 echo
-echo "==> 依赖"
-otool -L "$OUT" || true
-
+echo "== LC_ID_DYLIB（必须是 @executable_path/Frameworks/，否则 TrollFools 当 @rpath 处理会静默失败）=="
+otool -l "$DYLIB" | grep -A2 LC_ID_DYLIB | tail -2 || true
 echo
-echo "==> 架构"
-lipo -info "$OUT" || true
-
+echo "== LC_RPATH（应为空；有 @rpath 说明 install_name 配错了）=="
+otool -l "$DYLIB" | grep -c LC_RPATH || echo "0"
 echo
-echo "==> 本地符号（-fvisibility=hidden 下业务符号是 local，用 nm -a 看）"
-nm -a "$OUT" 2>/dev/null | grep -i adlab | head -40 || true
-
+echo "== 符号 =="
+nm -a "$DYLIB" 2>/dev/null | grep -i 'adlab\|kswizzle\|hook_Double' | head -40 || true
 echo
-echo "==> 加载命令"
-otool -l "$OUT" | grep -E 'LC_ID_DYLIB|LC_RPATH|__interpose' || true
-
+echo "== 必备 selector 必须在 strings 里 =="
+for sel in \
+    "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:" \
+    "displayLinkWithTarget:selector:" \
+    "setRate:" \
+    "sendEvent:" \
+    "timeIntervalSinceReferenceDate"
+do
+    n=$(strings -a "$DYLIB" | grep -c -- "$sel" || true)
+    if [ "$n" -gt 0 ]; then
+        echo "  OK   $sel"
+    else
+        echo "  FAIL $sel 缺失"
+        exit 1
+    fi
+done
 echo
-echo "==> 锚点字符串（必须出现 82 字节的 OLD 原文）"
-strings -a "$OUT" | grep -c 'showInspireAd:' || echo "0  <-- 异常：锚点缺失，补丁不可能命中"
-
+echo "== 连接信息 =="
+otool -L "$DYLIB"
 echo
-echo "完成。把 $OUT 拷到设备后用 TrollFools 注入 com.maobei.yydiary"
-echo "注意：v2 已彻底删除 __interpose（v1 崩溃根因），上面若出现 __interpose 段说明编到了旧源码。"
+echo "构建完成: $DYLIB"
